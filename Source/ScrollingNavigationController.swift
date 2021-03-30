@@ -52,7 +52,7 @@ import UIKit
 }
 
 /**
- The direction of scrolling that a followe should follow when the navbar is collapsing.
+ The direction of scrolling that a follower should follow when the navbar is collapsing.
  The raw value determines the sign of content offset depending of collapse direction.
  
  - scrollUp: scrolling up direction
@@ -61,6 +61,17 @@ import UIKit
 @objc public enum NavigationBarFollowerCollapseDirection: Int {
   case scrollUp = -1
   case scrollDown = 1
+}
+
+/**
+ The style used to collapse or expand the navbar.
+ 
+ - interactive: the navbar follows alongside the current offset of the scrollable view
+ - noninteractive: the navbar animates between collapsed and expanded states similar to the "Google" iOS app.
+     This style ignores the `delay` property.
+ */
+@objc public enum AnimationStyle: Int {
+  case interactive, nonInteractive
 }
 
 /**
@@ -152,6 +163,13 @@ open class ScrollingNavigationController: UINavigationController, UIGestureRecog
    */
   open var shouldScrollWhenTableViewIsEditing = false
   
+  /**
+   Detemines how the navbar animates between different states.
+   
+   Defaults to `interactive`
+   */
+  open var animationStyle: AnimationStyle = .interactive
+
   /// Holds the percentage of the navigation bar that is hidde. At 0 the navigation bar is fully visible, at 1 fully hidden. CGFloat with values from 0 to 1
   open var percentage: CGFloat {
     get {
@@ -210,7 +228,7 @@ open class ScrollingNavigationController: UINavigationController, UIGestureRecog
    - parameter scrollSearchBar : Determines whether or not the navigation bar should scroll when the search bar is visible. Defaults to false
    - parameter followers: An array of `NavigationBarFollower`s that will follow the navbar. The wrapper holds the direction that the view will follow
    */
-  open func followScrollView(_ scrollableView: UIView, delay: Double = 0, scrollSpeedFactor: Double = 1, collapseDirection: NavigationBarCollapseDirection = .scrollDown, additionalOffset: CGFloat = 0, scrollSearchBar: Bool = false, followers: [NavigationBarFollower] = []) {
+  open func followScrollView(_ scrollableView: UIView, delay: Double = 0, scrollSpeedFactor: Double = 1, collapseDirection: NavigationBarCollapseDirection = .scrollDown, additionalOffset: CGFloat = 0, scrollSearchBar: Bool = false, animationStyle: AnimationStyle = .interactive, followers: [NavigationBarFollower] = []) {
     savedNavBarTintColor = navigationBar.tintColor
     guard self.scrollableView == nil else {
       // Restore previous state. UIKit restores the navbar to its full height on view changes (e.g. during a modal presentation), so we need to restore the status once UIKit is done
@@ -240,6 +258,7 @@ open class ScrollingNavigationController: UINavigationController, UIGestureRecog
     maxDelay = CGFloat(delay)
     delayDistance = CGFloat(delay)
     scrollingEnabled = true
+    self.animationStyle = animationStyle
     self.additionalOffset = additionalOffset
     self.scrollSearchBar = scrollSearchBar
     
@@ -384,13 +403,20 @@ open class ScrollingNavigationController: UINavigationController, UIGestureRecog
       if gesture.state != .failed {
         lastContentOffset = translation.y
         if shouldScrollWithDelta(delta) {
-          scrollWithDelta(delta)
+          switch animationStyle {
+          case .interactive:
+            scrollWithDelta(delta)
+          case .nonInteractive:
+            scrollWithGestureRecognizer(gesture)
+          }
         }
       }
     }
     
     if gesture.state == .ended || gesture.state == .cancelled || gesture.state == .failed {
-      checkForPartialScroll()
+      if case .interactive = animationStyle {
+        checkForPartialScroll()
+      }
       lastContentOffset = 0
     }
   }
@@ -450,6 +476,43 @@ open class ScrollingNavigationController: UINavigationController, UIGestureRecog
   
   // MARK: - Scrolling functions
   
+  private func scrollWithGestureRecognizer(_ gestureRecognizer: UIGestureRecognizer) {
+    guard let panGesture = gestureRecognizer as? UIPanGestureRecognizer, let scrollView = self.scrollView() else { return }
+    
+    let velocity = panGesture.velocity(in: scrollView).y
+    
+    guard velocity != 0 else { return }
+        
+    let isCloseToTop = contentOffset.y <= navbarFullHeight
+    
+    // (Roughly) the velocity necessary to cause decelaration in a scrollview with default deceleration rate
+    let minimumFlickScrollVelocity: CGFloat = 200
+        
+    let targetState: NavigationBarState
+    if velocity < 0 {
+      // Hide navbar when user scrolls downwards
+      targetState = .collapsed
+    } else if isCloseToTop {
+      // Show navbar if user is near top of scrollable view and is scrolling upward
+      targetState = .expanded
+    } else if velocity > minimumFlickScrollVelocity, panGesture.state == .ended, scrollView.isDecelerating {
+      // Show navbar if user releases scrollable view with enough flick to cause scrollable view to decelerate
+      targetState = .expanded
+    } else {
+      return
+    }
+    
+    guard targetState != state else { return }
+    
+    let scrollDelta = scrollDeltaForNavbar(expanded: targetState == .expanded)
+    let distance = scrollDelta / (navigationBar.frame.height / 2)
+    let duration = TimeInterval(abs(distance * 0.1))
+
+    UIView.animate(withDuration: duration, delay: 0, options: .curveEaseInOut, animations: {
+        self.commitScrollWithDelta(scrollDelta)
+    })
+  }
+  
   private func shouldScrollWithDelta(_ delta: CGFloat) -> Bool {
     let scrollDelta = delta
     // Do not hide too early
@@ -490,7 +553,7 @@ open class ScrollingNavigationController: UINavigationController, UIGestureRecog
       
       // Compute the bar position
       if frame.origin.y - scrollDelta < -navbarFullHeight {
-        scrollDelta = frame.origin.y + navbarFullHeight
+        scrollDelta = scrollDeltaForNavbar(expanded: false)
       }
       
       // Detect when the bar is completely collapsed
@@ -512,7 +575,7 @@ open class ScrollingNavigationController: UINavigationController, UIGestureRecog
       
       // Compute the bar position
       if frame.origin.y - scrollDelta > statusBarHeight {
-        scrollDelta = frame.origin.y - statusBarHeight
+        scrollDelta = scrollDeltaForNavbar(expanded: true)
       }
       
       // Detect when the bar is completely expanded
@@ -521,6 +584,15 @@ open class ScrollingNavigationController: UINavigationController, UIGestureRecog
       }
     }
     
+    commitScrollWithDelta(scrollDelta)
+  }
+  
+  private func scrollDeltaForNavbar(expanded: Bool) -> CGFloat {
+    let navbarYOrigin = navigationBar.frame.minY
+    return expanded ? navbarYOrigin - statusBarHeight : navbarYOrigin + navbarFullHeight
+  }
+  
+  private func commitScrollWithDelta(_ scrollDelta: CGFloat) {
     updateSizing(scrollDelta)
     updateNavbarAlpha()
     restoreContentOffset(scrollDelta)
